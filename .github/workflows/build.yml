@@ -1,0 +1,142 @@
+name: Build APK
+
+on:
+  push:
+    branches:
+      - build
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install dependencies (ImageMagick, jq, unzip, curl)
+        run: sudo apt-get update && sudo apt-get install -y imagemagick jq unzip curl
+
+      - name: Read build config
+        id: config
+        run: |
+          if [ -f build-config.json ]; then
+            echo "type=$(jq -r .type build-config.json)" >> $GITHUB_ENV
+            echo "build_type=$(jq -r .build_type build-config.json)" >> $GITHUB_ENV
+            cat build-config.json
+          else
+            echo "type=flutter" >> $GITHUB_ENV
+          fi
+
+      # ==========================================================
+      # 🚀 MODE 2 / WEB2APK (Android Gradle Murni Tanpa YAML/Flutter)
+      # ==========================================================
+      - name: Build Android Gradle Project (Web2APK)
+        if: env.type == 'web2apk'
+        run: |
+          echo "=== Memulai Build Android Gradle Project ==="
+          mkdir -p extracted_project
+          unzip -q flutter-project.zip -d extracted_project
+          
+          cd extracted_project
+          
+          # Cari letak gradlew secara rekursif
+          GRADLEW_PATH=$(find . -name "gradlew" -type f | head -n 1)
+          if [ -n "$GRADLEW_PATH" ]; then
+            GRADLE_DIR=$(dirname "$GRADLEW_PATH")
+            cd "$GRADLE_DIR"
+          fi
+          
+          echo "Direktori kerja Gradle: $(pwd)"
+          ls -la
+          
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Sign Android APK (Web2APK)
+        if: env.type == 'web2apk'
+        run: |
+          cd extracted_project
+          GRADLEW_PATH=$(find . -name "gradlew" -type f | head -n 1)
+          if [ -n "$GRADLEW_PATH" ]; then
+            GRADLE_DIR=$(dirname "$GRADLEW_PATH")
+            cd "$GRADLE_DIR"
+          fi
+
+          APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -f "$APK_PATH" ]; then
+            echo "Menandatangani APK: $APK_PATH"
+            keytool -genkey -v -keystore release.keystore -alias release -keyalg RSA -keysize 2048 -validity 10000 -storepass password -keypass password -dname "CN=BuildBot, OU=Dev, O=BuildBot, L=City, S=State, C=ID" || true
+            $ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -n1)/apksigner sign --ks release.keystore --ks-pass pass:password --key-pass pass:password "$APK_PATH"
+            echo "Verifikasi tanda tangan sukses!"
+          else
+            echo "❌ APK release tidak ditemukan!"
+            exit 1
+          fi
+
+      # ==========================================================
+      # 📱 MODE 1 / FLUTTER (Jalur Asli Flutter Project)
+      # ==========================================================
+      - name: Prepare Flutter project
+        if: env.type == 'flutter'
+        run: |
+          rm -rf flutter-project
+          mkdir -p flutter-project
+          unzip -q flutter-project.zip -d flutter-project
+
+          FIRST_DIR=$(find flutter-project -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          ROOT_FILES=$(find flutter-project -mindepth 1 -maxdepth 1 | wc -l)
+
+          if [ "$ROOT_FILES" = "1" ] && [ -n "$FIRST_DIR" ] && [ -f "$FIRST_DIR/pubspec.yaml" ]; then
+            TMP_DIR=$(mktemp -d)
+            cp -R "$FIRST_DIR"/. "$TMP_DIR"/
+            rm -rf flutter-project
+            mkdir -p flutter-project
+            cp -R "$TMP_DIR"/. flutter-project/
+          fi
+
+      - name: Setup Flutter SDK
+        if: env.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.0'
+          channel: stable
+          cache: true
+
+      - name: Build Flutter APK
+        if: env.type == 'flutter'
+        run: |
+          cd flutter-project
+          flutter pub get
+          flutter build apk --release
+
+      - name: Sign Flutter APK
+        if: env.type == 'flutter' && env.build_type == 'release'
+        run: |
+          APK_PATH=$(find flutter-project/build/app/outputs/flutter-apk -name "*.apk" | head -n 1)
+          if [ -f "$APK_PATH" ]; then
+            $ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -n1)/apksigner sign --ks release.keystore --ks-pass pass:password --key-pass pass:password "$APK_PATH"
+          fi
+
+      # ==========================================================
+      # 📦 UPLOAD ARTIFACT
+      # ==========================================================
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: |
+            extracted_project/**/app/build/outputs/apk/release/*.apk
+            flutter-project/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
